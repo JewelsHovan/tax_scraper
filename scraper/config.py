@@ -11,6 +11,6 @@ BASE_URL = "http://taxsearch.co.grayson.tx.us:8443/Property-Detail/PropertyQuick
 HEADERS = {
     'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/133.0.0.0 Safari/537.36'
 }
-BATCH_SIZE = 100  # Number of concurrent requests per worker
-NUM_WORKERS = 10  # Number of worker sessions to use
-CHECKPOINT_SIZE = 1000  # Save results to CSV after this many records
+BATCH_SIZE = 10  # Number of concurrent requests per worker
+NUM_WORKERS = 5  # Number of worker sessions to use
+CHECKPOINT_SIZE = 50  # Save results to CSV after this many records
