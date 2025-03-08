@@ -10,15 +10,28 @@ import time
 import csv
 from scraper.config import (
     BASE_URL, HEADERS, BATCH_SIZE, NUM_WORKERS,
-    CHECKPOINT_SIZE, ID_LIST_PATH, TAX_RESULTS_PATH
+    CHECKPOINT_SIZE, ID_LIST_PATH, TAX_RESULTS_PATH, DELAY, MAX_RETRIES, FAILED_IDS_PATH
 )
+from collections import Counter
 
-async def scrape_id_async(id, session):
+
+async def scrape_id_async(id, session, retry_count=0):
     """
     Asynchronously scrapes property tax information for a given ID.
+    Includes retry logic for failed requests.
     """
     try:
+        # Add delay before making the request
+        await asyncio.sleep(DELAY)  # delay between requests
+        
         async with session.get(BASE_URL.format(id=id), headers=HEADERS) as response:
+            if response.status >= 400:
+                if retry_count < MAX_RETRIES - 1:
+                    print(f"Request failed for ID {id} with status {response.status}. Retrying ({retry_count + 1}/{MAX_RETRIES})...")
+                    return await scrape_id_async(id, session, retry_count + 1)
+                else:
+                    return id, f"Failed after {MAX_RETRIES} attempts. Status: {response.status}"
+                    
             html = await response.text()
             soup = BeautifulSoup(html, 'html.parser')
 
@@ -49,7 +62,11 @@ async def scrape_id_async(id, session):
             }
 
     except Exception as e:
-        return id, f"Error scraping ID {id}: {str(e)}"
+        if retry_count < MAX_RETRIES - 1:
+            print(f"Error scraping ID {id}: {str(e)}. Retrying ({retry_count + 1}/{MAX_RETRIES})...")
+            return await scrape_id_async(id, session, retry_count + 1)
+        else:
+            return id, f"Error scraping ID {id} after {MAX_RETRIES} attempts: {str(e)}"
 
 async def save_checkpoint(data, is_first_write):
     """Save results to CSV file."""
@@ -62,7 +79,14 @@ async def save_checkpoint(data, is_first_write):
             writer.writerow([id, result])
     print(f"Checkpoint saved: {len(data)} results written to {TAX_RESULTS_PATH}")
 
-async def worker(worker_id, ids_chunk, processed_count, checkpoint_size):
+async def save_failed_ids(failed_ids):
+    """Save failed IDs to a separate file."""
+    with open(FAILED_IDS_PATH, 'w') as f:
+        for id in failed_ids:
+            f.write(f"{id}\n")
+    print(f"{len(failed_ids)} failed IDs saved to {FAILED_IDS_PATH}")
+
+async def worker(worker_id, ids_chunk, processed_count, checkpoint_size, failed_ids):
     """Worker process to handle a chunk of IDs."""
     worker_results = []
     for i in range(0, len(ids_chunk), BATCH_SIZE):
@@ -70,7 +94,12 @@ async def worker(worker_id, ids_chunk, processed_count, checkpoint_size):
         async with aiohttp.ClientSession() as session:
             tasks = [scrape_id_async(id, session) for id in batch]
             batch_results = await asyncio.gather(*tasks)
-            worker_results.extend(batch_results)
+            
+            # Filter out failed results
+            for id, result in batch_results:
+                if isinstance(result, str) and result.startswith(("Error", "Failed")):
+                    failed_ids.append(id)
+                worker_results.append((id, result))
 
             processed_count.value += len(batch)
             if processed_count.value % checkpoint_size == 0:
@@ -89,14 +118,16 @@ async def scrape_all_ids(ids_list):
         def __init__(self):
             self.value = 0
     processed_count = Counter()
+    failed_ids = []
 
+    # Calculate the number of IDs per worker
     chunk_size = len(ids_list) // NUM_WORKERS
     if len(ids_list) % NUM_WORKERS > 0:
         chunk_size += 1
 
     id_chunks = [ids_list[i:i+chunk_size] for i in range(0, len(ids_list), chunk_size)]
     worker_tasks = [
-        worker(i, chunk, processed_count, CHECKPOINT_SIZE)
+        worker(i, chunk, processed_count, CHECKPOINT_SIZE, failed_ids)
         for i, chunk in enumerate(id_chunks)
     ]
     
@@ -109,6 +140,11 @@ async def scrape_all_ids(ids_list):
 
     if remaining_results:
         await save_checkpoint(remaining_results, processed_count.value < CHECKPOINT_SIZE)
+    
+    # Save failed IDs
+    if failed_ids:
+        await save_failed_ids(failed_ids)
+        print(f"Failed to process {len(failed_ids)} IDs after {MAX_RETRIES} retries")
 
     return processed_count.value
 
@@ -118,12 +154,14 @@ def run_scraper():
     Returns the number of processed IDs.
     """
     try:
+        # Opening the ID list file and reading the IDs
         with open(ID_LIST_PATH, 'r') as f:
             ids_list = f.read().splitlines()
         
         print(f"\n--- Scraping Property Tax Information ---")
         print(f"Using {NUM_WORKERS} workers with batch size of {BATCH_SIZE}")
         
+        # log the start and stop time
         start_time = time.time()
         total_processed = asyncio.run(scrape_all_ids(ids_list))
         total_time = time.time() - start_time
